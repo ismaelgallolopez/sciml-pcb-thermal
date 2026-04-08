@@ -10,11 +10,251 @@ from matplotlib import colormaps
 np.set_printoptions(threshold=sys.maxsize)
 
 
+# ---------------------------------------------------------------------------
+# Resolution-independent physical abstractions
+# ---------------------------------------------------------------------------
+
+class PCBDomain:
+    """PCB physical parameters; produces node coordinates and coupling matrices."""
+
+    def __init__(self, Lx: float, Ly: float, thickness: float,
+                 k_xy: float, rho_cp: float, emissivity: float):
+        self.Lx = Lx
+        self.Ly = Ly
+        self.thickness = thickness
+        self.k_xy = k_xy        # thermal conductivity [W/(m·K)]
+        self.rho_cp = rho_cp    # volumetric heat capacity ρ·c_p [J/(m³·K)]
+        self.emissivity = emissivity
+
+    def discretize(self, nx: int, ny: int):
+        """
+        Discretise on an nx×ny regular grid.
+        Node ordering: id = i + nx*j  (x-index fast, y-index slow).
+
+        Returns
+        -------
+        X : (n,)     x-coordinates of node centres [m]
+        Y : (n,)     y-coordinates of node centres [m]
+        C : (n,)     lumped capacitance  C_i = rho_cp · dx · dy · thickness  [J/K]
+        K : sparse   conductive coupling K_ij = k · (face_area / centre_dist) [W/K]
+        R : sparse   radiative factor    R_ij = ε · 2 · dx · dy               [m²]
+                     (multiply by σ_SB externally to get [W/K⁴·m²])
+        """
+        dx = self.Lx / (nx - 1)
+        dy = self.Ly / (ny - 1)
+        n = nx * ny
+
+        i_idx = np.tile(np.arange(nx), ny)    # x-index for each node
+        j_idx = np.repeat(np.arange(ny), nx)  # y-index for each node
+        X = i_idx.astype(float) * dx
+        Y = j_idx.astype(float) * dy
+
+        C = np.full(n, self.rho_cp * dx * dy * self.thickness)
+
+        GLx = self.thickness * self.k_xy * dy / dx  # k · (dy·t) / dx
+        GLy = self.thickness * self.k_xy * dx / dy  # k · (dx·t) / dy
+        rows, cols, data = [], [], []
+        for j in range(ny):
+            for i in range(nx):
+                nid = i + nx * j
+                diag = 0.0
+                for di, dj, GL in ((1, 0, GLx), (-1, 0, GLx),
+                                   (0, 1, GLy),  (0, -1, GLy)):
+                    ni2, nj2 = i + di, j + dj
+                    if 0 <= ni2 < nx and 0 <= nj2 < ny:
+                        rows.append(nid)
+                        cols.append(ni2 + nx * nj2)
+                        data.append(-GL)
+                        diag += GL
+                rows.append(nid); cols.append(nid); data.append(diag)
+        K = sparse.csr_matrix((data, (rows, cols)), shape=(n, n))
+
+        GR = 2.0 * dx * dy * self.emissivity   # top + bottom face area × ε
+        R = sparse.diags(np.full(n, GR), format='csr')
+
+        return X, Y, C, K, R
+
+
+class HeaterPatch:
+    """Rectangular power source defined by physical centre, size, and total power."""
+
+    def __init__(self, x_center: float, y_center: float,
+                 width: float, height: float, Q_dot_W: float):
+        self.x_center = x_center
+        self.y_center = y_center
+        self.width    = width
+        self.height   = height
+        self.Q_dot_W  = Q_dot_W
+
+    def apply_sources(self, X: np.ndarray, Y: np.ndarray,
+                      dx: float, dy: float) -> np.ndarray:
+        """
+        Return Q vector with Q_dot_W distributed by fractional cell-overlap area.
+        Node at (x_i, y_i) owns cell [x_i ± dx/2, y_i ± dy/2].
+        Overlap is computed in physical metres and normalised by the patch area
+        (self.width × self.height), so Q.sum() == Q_dot_W whenever the patch
+        lies entirely within the domain.
+        """
+        patch_area = self.width * self.height
+        if patch_area <= 0.0:
+            return np.zeros(len(X))
+        x0 = self.x_center - self.width  / 2
+        x1 = self.x_center + self.width  / 2
+        y0 = self.y_center - self.height / 2
+        y1 = self.y_center + self.height / 2
+        # Overlap lengths in metres (not normalised by cell size)
+        ux = np.clip(np.minimum(X + dx/2, x1) - np.maximum(X - dx/2, x0), 0.0, None)
+        uy = np.clip(np.minimum(Y + dy/2, y1) - np.maximum(Y - dy/2, y0), 0.0, None)
+        weights = ux * uy          # overlap area per cell [m²]
+        Q = weights * (self.Q_dot_W / patch_area)
+        # Verify power conservation when the patch is fully inside the domain
+        if abs(weights.sum() - patch_area) < 1e-9 * patch_area:
+            assert abs(Q.sum() - self.Q_dot_W) < 1e-6 * self.Q_dot_W, (
+                f"HeaterPatch power not conserved: Q.sum()={Q.sum():.6e} W, "
+                f"Q_dot_W={self.Q_dot_W:.6e} W")
+        return Q
+
+
+class DirichletBC:
+    """Fixed-temperature (Dirichlet) boundary condition at selected nodes."""
+
+    def __init__(self, T_fixed: dict):
+        # T_fixed: {node_id (int): temperature [K]}
+        self.T_fixed = dict(T_fixed)
+
+    @classmethod
+    def from_physical(cls, coord_T_pairs, X: np.ndarray, Y: np.ndarray):
+        """
+        Construct by snapping physical (x, y) coordinates to their nearest nodes.
+
+        coord_T_pairs : iterable of ((x, y), T) tuples
+        """
+        T_fixed = {}
+        for (xc, yc), T in coord_T_pairs:
+            nid = int(np.argmin((X - xc)**2 + (Y - yc)**2))
+            T_fixed[nid] = float(T)
+        return cls(T_fixed)
+
+    def interface_ids(self) -> np.ndarray:
+        return np.array(list(self.T_fixed.keys()), dtype=int)
+
+    def as_interfaces_dict(self) -> dict:
+        return dict(self.T_fixed)
+
+
+class EdgeDirichletBC:
+    """Fixed-temperature boundary condition using geometric edge selection.
+    
+    Selects nodes by edge name using physical bounds:
+      left:   X < dx/2
+      right:  X > Lx - dx/2
+      bottom: Y < dy/2
+      top:    Y > Ly - dy/2
+    
+    Works identically at any (nx, ny) without nearest-neighbor snapping.
+    """
+
+    def __init__(self, edge: str, T_fixed: float, Lx: float, Ly: float, nx: int, ny: int):
+        if edge not in ("left", "right", "bottom", "top"):
+            raise ValueError(f"edge must be 'left', 'right', 'bottom', or 'top', got '{edge}'")
+        self.edge = edge
+        self.T_fixed_value = float(T_fixed)
+        self.Lx = Lx
+        self.Ly = Ly
+        self.nx = nx
+        self.ny = ny
+
+    def get_nodes_and_temps(self, X: np.ndarray, Y: np.ndarray) -> dict:
+        dx = self.Lx / (self.nx - 1)
+        dy = self.Ly / (self.ny - 1)
+        T_fixed_dict = {}
+        for nid in range(len(X)):
+            x, y = X[nid], Y[nid]
+            is_on_edge = False
+            if self.edge == "left":
+                is_on_edge = x < dx / 2
+            elif self.edge == "right":
+                is_on_edge = x > self.Lx - dx / 2
+            elif self.edge == "bottom":
+                is_on_edge = y < dy / 2
+            elif self.edge == "top":
+                is_on_edge = y > self.Ly - dy / 2
+            if is_on_edge:
+                T_fixed_dict[nid] = self.T_fixed_value
+        return T_fixed_dict
+
+    def as_interfaces_dict(self, X: np.ndarray, Y: np.ndarray) -> dict:
+        return self.get_nodes_and_temps(X, Y)
+
+
+class RadiativeBC:
+    """
+    Radiative boundary condition for edge nodes.
+    Each edge node radiates to T_env through its exposed PCB side face.
+    R_env = emissivity × exposed_face_area  (σ_SB is applied by the solver).
+    Call augment_radiation() to fold this into the R matrix from PCBDomain.
+    """
+
+    def __init__(self, T_env: float, emissivity: float):
+        self.T_env      = T_env
+        self.emissivity = emissivity
+
+    def augment_radiation(self, R: sparse.spmatrix,
+                          nx: int, ny: int,
+                          dx: float, dy: float,
+                          thickness: float) -> tuple:
+        """
+        Add exposed-side-face radiative factors on the diagonal for edge nodes.
+        Also compute the forcing vector F_rad for radiation FROM the environment.
+        
+        Returns
+        -------
+        R_aug : sparse matrix (CSR)
+            Augmented radiative coupling matrix.
+        F_rad : ndarray
+            Forcing vector where F_rad[i] = R_env_i * T_env**4 for boundary nodes,
+            0 elsewhere. Must be multiplied by sigma_SB in the solver.
+        """
+        R_lil = R.tolil()
+        F_rad = np.zeros(nx * ny)
+        for j in range(ny):
+            for i in range(nx):
+                nid = i + nx * j
+                extra = 0.0
+                if i == 0 or i == nx - 1:
+                    extra += self.emissivity * dy * thickness
+                if j == 0 or j == ny - 1:
+                    extra += self.emissivity * dx * thickness
+                if extra > 0.0:
+                    R_lil[nid, nid] = R_lil[nid, nid] + extra
+                    F_rad[nid] = extra * (self.T_env ** 4)
+        return R_lil.tocsr(), F_rad
+
+
+def initial_condition(X: np.ndarray, Y: np.ndarray, params) -> np.ndarray:
+    """
+    Sample an initial temperature field at node centres.
+
+    Parameters
+    ----------
+    X, Y   : node centre coordinate arrays (same ordering as solver)
+    params : float    → uniform field  T0[i] = params  for all i
+             ndarray  → spatially varying field (must match len(X))
+    """
+    if np.isscalar(params):
+        return np.full(len(X), float(params))
+    arr = np.asarray(params, dtype=float)
+    if arr.shape != X.shape:
+        raise ValueError(
+            f"initial_condition: params shape {arr.shape} != node array shape {X.shape}")
+    return arr.copy()
+
+
 #####################################################################################################
 ####################################### ODE and RHS functions #######################################
 #####################################################################################################
 
-def pcb_rhs(t, T, K, E, Q, interface_nodes_id, board_c, board_rho, thickness, dx, dy, Tenv):
+def pcb_rhs(t, T, K, E, Q, F_rad, interface_nodes_id, board_c, board_rho, thickness, dx, dy, Tenv):
     """
     Compute dT/dt for all nodes — the right-hand side of the heat ODE.
     This function is compatible with scipy.integrate.solve_ivp for adaptive time stepping.
@@ -31,6 +271,9 @@ def pcb_rhs(t, T, K, E, Q, interface_nodes_id, board_c, board_rho, thickness, dx
         Radiation coupling matrix.
     Q : np.ndarray
         Heat source vector (includes heater powers).
+    F_rad : np.ndarray
+        Radiative forcing vector from environment: F_rad[i] = R_env_i * T_env**4.
+        Multiplied by Boltzmann constant in this function.
     interface_nodes_id : np.ndarray
         Array of node indices corresponding to boundary conditions (interfaces).
     board_c : float
@@ -52,8 +295,8 @@ def pcb_rhs(t, T, K, E, Q, interface_nodes_id, board_c, board_rho, thickness, dx
         Temperature time derivative at each node.
     """
     Boltzmann = 5.67e-8
-    dTdt = (Q - K.dot(T) - Boltzmann * E.dot(T**4 - Tenv**4)) / (board_c * board_rho * thickness * dx * dy)
-    dTdt[interface_nodes_id] = 0.0  # BCs are fixed: dT/dt = 0 at interface nodes
+    dTdt = (Q - K.dot(T) - Boltzmann * E.dot(T**4) + Boltzmann * F_rad) / (board_c * board_rho * thickness * dx * dy)
+    dTdt[interface_nodes_id] = 0.0
     return dTdt
 
 
@@ -86,9 +329,10 @@ def get_node_coordinates(nx, ny, Lx, Ly):
 #####################################################################################################
 
 def PCB_case_1(L:float=0.1,thickness:float=0.001,m:int=3,board_k:float=1,ir_emmisivity:float=0.8,
-                    T_interfaces:list=[250,250,250,250],Q_heaters:list=[1.0,1.0,1.0,1.0],Tenv:float=250,display:bool = False):
+                    T_interfaces:list=[250,250,250,250],Q_heaters:list=[1.0,1.0,1.0,1.0],Tenv:float=250,display:bool = False,
+                    T_init:float=298.0):
     """
-    Caso 1. 
+    Caso 1.
     PCB cuadrada de lado L con 4 heaters simétricamente colocados en coordenadas [(L/4,L/2),(L/2,L/4),(3*L/4,L/2),(L/2,3*L/4)]
     y con 4 nodos de interfaz situados en coordenadas [(0,0),(L,0),(L,L),(0,L)].
     Variables de entrada (unidades entre [], si no hay nada es adimensional):
@@ -96,29 +340,55 @@ def PCB_case_1(L:float=0.1,thickness:float=0.001,m:int=3,board_k:float=1,ir_emmi
                         -- thickness (float) = espesor de la placa. [m]
                         -- m (int) = valor de refinamiento de malla. --> el número de nodos en x e y es n = 4*m+1. En el caso predeterminado son 12x12 nodos.
                         -- board_k (float) = conductividad térmica del material de la placa. [W/(K*m)]
-                        -- ir_emmisivity (float) = emisividad infrarroja del recubrimiento óptico de la PCB (la pintura). 
+                        -- ir_emmisivity (float) = emisividad infrarroja del recubrimiento óptico de la PCB (la pintura).
                         -- T_interfaces (lista de 4 elementos) = temperatura de las 4 interfaces. [K]
                         -- Q_heaters (lista de 4 elementos) = potencia disipada por los heaters. [W]
                         -- Tenv (float) = temperatura del entorno. [K]
                         -- display (bool) = mostrar las temperaturas.
+                        -- T_init (float) = initial guess for the Newton solver [K].
     Variables de salida:
                         -- T (numpy.array con dimension n = nx*ny) = vector con las temperaturas de los nodos (más información mirar en la descripción de **PCB_solver_main()**).
                         -- interfaces (diccionario {key = id del nodo, value = temperatura del nodo [K]}) = temperatura de las interfaces.
                         -- heaters (diccionario {key = id del nodo, value = disipación del nodo [W]}) = potencia disipada por los heaters.
     """
 
-    n = 4*m+1
+    n = 4*m + 1
+    dx = L / (n - 1)
+    dy = L / (n - 1)
 
-    id_Qnodes = [int((n-1)/4+(n-1)/2*n),int((n-1)/2+(n-1)/4*n),int(3*(n-1)/4+(n-1)/2*n),int((n-1)/2+3*(n-1)/4*n)]
-    heaters = {id_Qnodes[0]:Q_heaters[0],id_Qnodes[1]:Q_heaters[1],id_Qnodes[2]:Q_heaters[2],id_Qnodes[3]:Q_heaters[3]}
+    # Discretise domain to get node coordinates (rho_cp unused in steady-state)
+    domain = PCBDomain(Lx=L, Ly=L, thickness=thickness, k_xy=board_k,
+                       rho_cp=1.0, emissivity=ir_emmisivity)
+    X, Y, _, _, _ = domain.discretize(n, n)
 
-    id_inodes = [0,n-1,n*n-1,n*n-n]
-    interfaces = {id_inodes[0]:T_interfaces[0],id_inodes[1]:T_interfaces[1],id_inodes[2]:T_interfaces[2],id_inodes[3]:T_interfaces[3]}
+    # Heater patches at physical locations; one-cell size → all power to nearest node
+    patches = [
+        HeaterPatch(L/4,   L/2,   dx, dy, Q_heaters[0]),
+        HeaterPatch(L/2,   L/4,   dx, dy, Q_heaters[1]),
+        HeaterPatch(3*L/4, L/2,   dx, dy, Q_heaters[2]),
+        HeaterPatch(L/2,   3*L/4, dx, dy, Q_heaters[3]),
+    ]
+    Q_vec = np.zeros(n * n)
+    for p in patches:
+        Q_vec += p.apply_sources(X, Y, dx, dy)
+    heaters = {i: Q_vec[i] for i in range(n * n) if Q_vec[i] != 0.0}
 
-    T, _ = PCB_solver_main(solver='steady', Lx=L, Ly=L, thickness=thickness,nx=n,ny=n,board_k=board_k,ir_emmisivity=ir_emmisivity,
-                    Tenv=Tenv,interfaces=interfaces,heaters=heaters, display=display)
-    
-    return T,interfaces,heaters
+    # Dirichlet BC: corner nodes snapped from physical coordinates
+    bc = DirichletBC.from_physical(
+        [((0.0, 0.0), T_interfaces[0]), ((L, 0.0), T_interfaces[1]),
+         ((L,   L),   T_interfaces[2]), ((0.0, L),  T_interfaces[3])],
+        X, Y)
+    interfaces = bc.as_interfaces_dict()
+
+    # Initial condition sampled at node centres
+    T0 = initial_condition(X, Y, T_init)
+
+    T, _ = PCB_solver_main(solver='steady', Lx=L, Ly=L, thickness=thickness,
+                    nx=n, ny=n, board_k=board_k, ir_emmisivity=ir_emmisivity,
+                    Tenv=Tenv, interfaces=interfaces, heaters=heaters,
+                    display=display, T_init=T0)
+
+    return T, interfaces, heaters
 
 
 #####################################################################################################
@@ -147,17 +417,43 @@ def PCB_case_2(solver: str = 'steady', L:float=0.1,thickness:float=0.001,m:int=3
                         -- heaters (diccionario {key = id del nodo, value = disipación del nodo [W]}) = potencia disipada por los heaters.
     """
 
-    n = 4*m+1
+    n = 4*m + 1
+    dx = L / (n - 1)
+    dy = L / (n - 1)
 
-    id_Qnodes = [int((n-1)/4+(n-1)/2*n),int((n-1)/2+(n-1)/4*n),int((n-1)/4+3*(n-1)/4*n),int(3*(n-1)/4+3*(n-1)/4*n)]
-    heaters = {id_Qnodes[0]:Q_heaters[0],id_Qnodes[1]:Q_heaters[1],id_Qnodes[2]:Q_heaters[2],id_Qnodes[3]:Q_heaters[3]}
+    # Discretise domain to get node coordinates
+    domain = PCBDomain(Lx=L, Ly=L, thickness=thickness, k_xy=board_k,
+                       rho_cp=board_rho * board_c, emissivity=ir_emmisivity)
+    X, Y, _, _, _ = domain.discretize(n, n)
 
-    id_inodes = [0,n-1,n*n-1,n*n-n]
-    interfaces = {id_inodes[0]:T_interfaces[0],id_inodes[1]:T_interfaces[1],id_inodes[2]:T_interfaces[2],id_inodes[3]:T_interfaces[3]}
+    # Heater patches at physical locations; one-cell size → all power to nearest node
+    patches = [
+        HeaterPatch(L/4,   L/2,   dx, dy, Q_heaters[0]),
+        HeaterPatch(L/2,   L/4,   dx, dy, Q_heaters[1]),
+        HeaterPatch(L/4,   3*L/4, dx, dy, Q_heaters[2]),
+        HeaterPatch(3*L/4, 3*L/4, dx, dy, Q_heaters[3]),
+    ]
+    Q_vec = np.zeros(n * n)
+    for p in patches:
+        Q_vec += p.apply_sources(X, Y, dx, dy)
+    heaters = {i: Q_vec[i] for i in range(n * n) if Q_vec[i] != 0.0}
 
-    T, time_array = PCB_solver_main(solver = solver, Lx=L, Ly=L, thickness=thickness,nx=n,ny=n,board_k=board_k, board_c=board_c, board_rho=board_rho, ir_emmisivity=ir_emmisivity,
-                    Tenv=Tenv,interfaces=interfaces,heaters=heaters, display=display, time=time, dt=dt, T_init = T_init, n_uniform_samples=n_uniform_samples)
-    
+    # Dirichlet BC: corner nodes snapped from physical coordinates
+    bc = DirichletBC.from_physical(
+        [((0.0, 0.0), T_interfaces[0]), ((L, 0.0), T_interfaces[1]),
+         ((L,   L),   T_interfaces[2]), ((0.0, L),  T_interfaces[3])],
+        X, Y)
+    interfaces = bc.as_interfaces_dict()
+
+    # Initial condition sampled at node centres
+    T0 = initial_condition(X, Y, T_init)
+
+    T, time_array = PCB_solver_main(solver=solver, Lx=L, Ly=L, thickness=thickness,
+                    nx=n, ny=n, board_k=board_k, board_c=board_c, board_rho=board_rho,
+                    ir_emmisivity=ir_emmisivity, Tenv=Tenv, interfaces=interfaces,
+                    heaters=heaters, display=display, time=time, dt=dt, T_init=T0,
+                    n_uniform_samples=n_uniform_samples)
+
     return T, time_array, interfaces, heaters
     
 
@@ -333,10 +629,14 @@ def PCB_solver_main(solver:str, Lx:float,Ly:float,thickness:float,nx:int,ny:int,
         for i_node in interfaces:
             T_init_vec[i_node] = interfaces[i_node]
         
+        # Compute radiative forcing vector F_rad for environment radiation at T_env
+        rad_bc = RadiativeBC(Tenv, ir_emmisivity)
+        E_aug, F_rad = rad_bc.augment_radiation(E, nx, ny, dx, dy, thickness)
+        
         # Adaptive integration with stiffness detection + fallback to Radau
         # First attempt with RK45 (explicit, good for non-stiff to mildly stiff problems)
         sol = solve_ivp(
-            fun=lambda t, T: pcb_rhs(t, T, K, E, Q, interface_nodes_id, board_c, board_rho, thickness, dx, dy, Tenv),
+            fun=lambda t, T: pcb_rhs(t, T, K, E_aug, Q, F_rad, interface_nodes_id, board_c, board_rho, thickness, dx, dy, Tenv),
             t_span=(0.0, time),
             y0=T_init_vec,
             method='RK45',
@@ -352,7 +652,7 @@ def PCB_solver_main(solver:str, Lx:float,Ly:float,thickness:float,nx:int,ny:int,
             if display:
                 print(f"RK45 returned status {sol.status}: {sol.message}. Retrying with Radau (implicit stiff solver)...")
             sol = solve_ivp(
-                fun=lambda t, T: pcb_rhs(t, T, K, E, Q, interface_nodes_id, board_c, board_rho, thickness, dx, dy, Tenv),
+                fun=lambda t, T: pcb_rhs(t, T, K, E_aug, Q, F_rad, interface_nodes_id, board_c, board_rho, thickness, dx, dy, Tenv),
                 t_span=(0.0, time),
                 y0=T_init_vec,
                 method='Radau',
