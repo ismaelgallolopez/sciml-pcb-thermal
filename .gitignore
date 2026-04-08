@@ -42,13 +42,19 @@ ehthumbs.db
 .ipynb_checkpoints/
 *.ipynb
 
-# Data and outputs
+# Data and outputs (gitignored)
+data/
+results/
 *.png
 *.jpg
 *.jpeg
 *.csv
 *.h5
 *.hdf5
+*.npy
+*.npz
+*.pt
+*.pth
 
 # Temporary files
 *.tmp

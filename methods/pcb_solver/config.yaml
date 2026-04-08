@@ -1,0 +1,53 @@
+# PCB Solver Configuration
+
+method_name: PCB_Transient_Solver
+
+# Physics parameters
+physics:
+  domain_size: 0.1  # [m]
+  pcb_thickness: 0.001  # [m]
+  board_k: 15  # thermal conductivity [W/(m·K)]
+  board_c: 900  # specific heat capacity [J/(kg·K)]
+  board_rho: 2700  # density [kg/m³]
+  ir_emissivity: 0.8
+
+# Mesh configuration
+mesh:
+  refinement: 3  # m factor: nodes = (4*m+1)²
+  total_nodes: 169  # (4*3+1)² = 13²
+
+# Solver settings
+solver:
+  transient:
+    method_primary: RK45  # explicit Runge-Kutta
+    method_fallback: Radau  # implicit stiff solver
+    rtol: 1e-6
+    atol: 1e-8
+  steady:
+    max_iterations: 1000
+    tolerance: 0.01
+
+# Boundary conditions
+boundary_conditions:
+  interface_temp_range: [250, 350]  # [K]
+
+# Heat sources
+heaters:
+  power_range: [0.1, 5.0]  # [W]
+  size_fraction: 0.1  # fraction of domain size
+
+# Environment
+environment:
+  default_temp: 250  # [K]
+  temp_range: [250, 350]  # [K]
+
+# Initial conditions
+initial_condition:
+  temp_range: [290, 310]  # [K]
+  spatial_variation: false  # uniform vs spatially-varying
+
+# Simulation parameters
+simulation:
+  time_range: [1.0, 100.0]  # [s]
+  dt_max: 0.1  # [s]
+  time_samples_uniform: 100  # for uniform resampling
