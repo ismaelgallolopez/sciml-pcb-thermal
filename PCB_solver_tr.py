@@ -35,7 +35,10 @@ class PCBDomain:
         -------
         X : (n,)     x-coordinates of node centres [m]
         Y : (n,)     y-coordinates of node centres [m]
-        C : (n,)     lumped capacitance  C_i = rho_cp · dx · dy · thickness  [J/K]
+        C : (n,)     lumped capacitance accounting for boundary node cell fractions [J/K]
+                     Corner nodes: (dx/2)·(dy/2)·thickness
+                     Edge nodes: (dx/2)·dy·thickness or dx·(dy/2)·thickness
+                     Interior nodes: dx·dy·thickness
         K : sparse   conductive coupling K_ij = k · (face_area / centre_dist) [W/K]
         R : sparse   radiative factor    R_ij = ε · 2 · dx · dy               [m²]
                      (multiply by σ_SB externally to get [W/K⁴·m²])
@@ -49,7 +52,16 @@ class PCBDomain:
         X = i_idx.astype(float) * dx
         Y = j_idx.astype(float) * dy
 
-        C = np.full(n, self.rho_cp * dx * dy * self.thickness)
+        # Compute per-node capacitance accounting for boundary cell fractions
+        C = np.zeros(n)
+        for j in range(ny):
+            for i in range(nx):
+                nid = i + nx * j
+                # Determine cell width and height for this node
+                width_frac = 1.0 if 0 < i < nx - 1 else 0.5  # Edge nodes own half-width
+                height_frac = 1.0 if 0 < j < ny - 1 else 0.5  # Edge nodes own half-height
+                cell_area = width_frac * height_frac * dx * dy
+                C[nid] = self.rho_cp * cell_area * self.thickness
 
         GLx = self.thickness * self.k_xy * dy / dx  # k · (dy·t) / dx
         GLy = self.thickness * self.k_xy * dx / dy  # k · (dx·t) / dy
@@ -254,7 +266,7 @@ def initial_condition(X: np.ndarray, Y: np.ndarray, params) -> np.ndarray:
 ####################################### ODE and RHS functions #######################################
 #####################################################################################################
 
-def pcb_rhs(t, T, K, E, Q, F_rad, interface_nodes_id, board_c, board_rho, thickness, dx, dy, Tenv):
+def pcb_rhs(t, T, K, E, Q, F_rad, interface_nodes_id, C):
     """
     Compute dT/dt for all nodes — the right-hand side of the heat ODE.
     This function is compatible with scipy.integrate.solve_ivp for adaptive time stepping.
@@ -268,7 +280,7 @@ def pcb_rhs(t, T, K, E, Q, F_rad, interface_nodes_id, board_c, board_rho, thickn
     K : sparse matrix
         Conductivity coupling matrix.
     E : sparse matrix
-        Radiation coupling matrix.
+        Radiation coupling matrix (augmented with environment radiation).
     Q : np.ndarray
         Heat source vector (includes heater powers).
     F_rad : np.ndarray
@@ -276,18 +288,8 @@ def pcb_rhs(t, T, K, E, Q, F_rad, interface_nodes_id, board_c, board_rho, thickn
         Multiplied by Boltzmann constant in this function.
     interface_nodes_id : np.ndarray
         Array of node indices corresponding to boundary conditions (interfaces).
-    board_c : float
-        Specific heat capacity [J/(kg·K)].
-    board_rho : float
-        Density [kg/m³].
-    thickness : float
-        PCB thickness [m].
-    dx : float
-        Grid spacing in x-direction [m].
-    dy : float
-        Grid spacing in y-direction [m].
-    Tenv : float
-        Environment temperature [K].
+    C : np.ndarray
+        Per-node lumped capacitance [J/K], accounting for boundary cell fractions.
     
     Returns:
     --------
@@ -295,7 +297,7 @@ def pcb_rhs(t, T, K, E, Q, F_rad, interface_nodes_id, board_c, board_rho, thickn
         Temperature time derivative at each node.
     """
     Boltzmann = 5.67e-8
-    dTdt = (Q - K.dot(T) - Boltzmann * E.dot(T**4) + Boltzmann * F_rad) / (board_c * board_rho * thickness * dx * dy)
+    dTdt = (Q - K.dot(T) - Boltzmann * E.dot(T**4) + Boltzmann * F_rad) / C
     dTdt[interface_nodes_id] = 0.0
     return dTdt
 
@@ -356,10 +358,10 @@ def PCB_case_1(L:float=0.1,thickness:float=0.001,m:int=3,board_k:float=1,ir_emmi
     dx = L / (n - 1)
     dy = L / (n - 1)
 
-    # Discretise domain to get node coordinates (rho_cp unused in steady-state)
+    # Discretise domain to get node coordinates and matrices
     domain = PCBDomain(Lx=L, Ly=L, thickness=thickness, k_xy=board_k,
                        rho_cp=1.0, emissivity=ir_emmisivity)
-    X, Y, _, _, _ = domain.discretize(n, n)
+    X, Y, C, K, R = domain.discretize(n, n)
 
     # Heater patches at physical locations; one-cell size → all power to nearest node
     patches = [
@@ -373,12 +375,12 @@ def PCB_case_1(L:float=0.1,thickness:float=0.001,m:int=3,board_k:float=1,ir_emmi
         Q_vec += p.apply_sources(X, Y, dx, dy)
     heaters = {i: Q_vec[i] for i in range(n * n) if Q_vec[i] != 0.0}
 
-    # Dirichlet BC: corner nodes snapped from physical coordinates
-    bc = DirichletBC.from_physical(
-        [((0.0, 0.0), T_interfaces[0]), ((L, 0.0), T_interfaces[1]),
-         ((L,   L),   T_interfaces[2]), ((0.0, L),  T_interfaces[3])],
-        X, Y)
-    interfaces = bc.as_interfaces_dict()
+    # Dirichlet BC: corner nodes assigned directly
+    interfaces = {}
+    interfaces[0] = T_interfaces[0]  # Bottom-left (0, 0)
+    interfaces[n - 1] = T_interfaces[1]  # Bottom-right (n-1, 0)
+    interfaces[n * (n - 1) + (n - 1)] = T_interfaces[2]  # Top-right (n-1, n-1)
+    interfaces[n * (n - 1)] = T_interfaces[3]  # Top-left (0, n-1)
 
     # Initial condition sampled at node centres
     T0 = initial_condition(X, Y, T_init)
@@ -386,7 +388,7 @@ def PCB_case_1(L:float=0.1,thickness:float=0.001,m:int=3,board_k:float=1,ir_emmi
     T, _ = PCB_solver_main(solver='steady', Lx=L, Ly=L, thickness=thickness,
                     nx=n, ny=n, board_k=board_k, ir_emmisivity=ir_emmisivity,
                     Tenv=Tenv, interfaces=interfaces, heaters=heaters,
-                    display=display, T_init=T0)
+                    C=C, K_domain=K, R_domain=R, display=display, T_init=T0)
 
     return T, interfaces, heaters
 
@@ -395,8 +397,8 @@ def PCB_case_1(L:float=0.1,thickness:float=0.001,m:int=3,board_k:float=1,ir_emmi
 ######################################### PCB_case_2() ##############################################
 #####################################################################################################
 
-def PCB_case_2(solver: str = 'steady', L:float=0.1,thickness:float=0.001,m:int=3,board_k:float=15, board_c:float=900, board_rho: float = 2700, ir_emmisivity:float=0.8,
-                    T_interfaces:list=[250,250,250,250],Q_heaters:list=[1.0,1.0,1.0,1.0],Tenv:float=250,display:bool = False, time:float = 0.0, dt:float = 0.0, T_init:float = 298.0, n_uniform_samples:int = 0):
+def PCB_case_2(solver: str = 'steady', L:float=0.1, thickness:float=0.001, m:int=3, board_k:float=15, board_c:float=900, board_rho:float=2700, ir_emmisivity:float=0.8,
+                    T_interfaces:list=[250,250,250,250], Q_heaters:list=[1.0,1.0,1.0,1.0], Tenv:float=250, display:bool=False, time:float=0.0, dt:float=0.0, T_init:float=298.0, n_uniform_samples:int=0, heater_size:float=None):
     """
     Caso 1
     PCB cuadrada de lado L con 4 heaters colocados en coordenadas [(L/4,L/2),(L/2,L/4),(L/4,3*L/4),(3*L/4,3*L/4)]
@@ -420,30 +422,34 @@ def PCB_case_2(solver: str = 'steady', L:float=0.1,thickness:float=0.001,m:int=3
     n = 4*m + 1
     dx = L / (n - 1)
     dy = L / (n - 1)
+    
+    # Set heater size: default to L/10 (10% of board side length, independent of mesh)
+    if heater_size is None:
+        heater_size = L / 10
 
-    # Discretise domain to get node coordinates
+    # Discretise domain to get node coordinates and matrices
     domain = PCBDomain(Lx=L, Ly=L, thickness=thickness, k_xy=board_k,
                        rho_cp=board_rho * board_c, emissivity=ir_emmisivity)
-    X, Y, _, _, _ = domain.discretize(n, n)
+    X, Y, C_domain, K_domain, R_domain = domain.discretize(n, n)
 
-    # Heater patches at physical locations; one-cell size → all power to nearest node
+    # Heater patches at physical locations with fixed physical size (resolution-independent)
     patches = [
-        HeaterPatch(L/4,   L/2,   dx, dy, Q_heaters[0]),
-        HeaterPatch(L/2,   L/4,   dx, dy, Q_heaters[1]),
-        HeaterPatch(L/4,   3*L/4, dx, dy, Q_heaters[2]),
-        HeaterPatch(3*L/4, 3*L/4, dx, dy, Q_heaters[3]),
+        HeaterPatch(L/4,   L/2,   heater_size, heater_size, Q_heaters[0]),
+        HeaterPatch(L/2,   L/4,   heater_size, heater_size, Q_heaters[1]),
+        HeaterPatch(L/4,   3*L/4, heater_size, heater_size, Q_heaters[2]),
+        HeaterPatch(3*L/4, 3*L/4, heater_size, heater_size, Q_heaters[3]),
     ]
     Q_vec = np.zeros(n * n)
     for p in patches:
         Q_vec += p.apply_sources(X, Y, dx, dy)
     heaters = {i: Q_vec[i] for i in range(n * n) if Q_vec[i] != 0.0}
 
-    # Dirichlet BC: corner nodes snapped from physical coordinates
-    bc = DirichletBC.from_physical(
-        [((0.0, 0.0), T_interfaces[0]), ((L, 0.0), T_interfaces[1]),
-         ((L,   L),   T_interfaces[2]), ((0.0, L),  T_interfaces[3])],
-        X, Y)
-    interfaces = bc.as_interfaces_dict()
+    # Dirichlet BC: corner nodes assigned directly
+    interfaces = {}
+    interfaces[0] = T_interfaces[0]  # Bottom-left (0, 0)
+    interfaces[n - 1] = T_interfaces[1]  # Bottom-right (n-1, 0)
+    interfaces[n * (n - 1) + (n - 1)] = T_interfaces[2]  # Top-right (n-1, n-1)
+    interfaces[n * (n - 1)] = T_interfaces[3]  # Top-left (0, n-1)
 
     # Initial condition sampled at node centres
     T0 = initial_condition(X, Y, T_init)
@@ -451,7 +457,8 @@ def PCB_case_2(solver: str = 'steady', L:float=0.1,thickness:float=0.001,m:int=3
     T, time_array = PCB_solver_main(solver=solver, Lx=L, Ly=L, thickness=thickness,
                     nx=n, ny=n, board_k=board_k, board_c=board_c, board_rho=board_rho,
                     ir_emmisivity=ir_emmisivity, Tenv=Tenv, interfaces=interfaces,
-                    heaters=heaters, display=display, time=time, dt=dt, T_init=T0,
+                    heaters=heaters, C=C_domain, K_domain=K_domain, R_domain=R_domain,
+                    display=display, time=time, dt=dt, T_init=T0,
                     n_uniform_samples=n_uniform_samples)
 
     return T, time_array, interfaces, heaters
@@ -462,9 +469,10 @@ def PCB_case_2(solver: str = 'steady', L:float=0.1,thickness:float=0.001,m:int=3
 ####################################### PCB_solver_main() ###########################################
 #####################################################################################################
 
-def PCB_solver_main(solver:str, Lx:float,Ly:float,thickness:float,nx:int,ny:int,board_k:float,  ir_emmisivity:float,
-                    Tenv:float,interfaces:dict,heaters:dict, display:bool = False, maxiters:int = 1000, objtol:int = 0.01, board_c:float=900, board_rho: float = 2700, time:float = 0.0, dt:float = 0.0,T_init = 298.0,
-                    n_uniform_samples:int = 0):
+def PCB_solver_main(solver:str, Lx:float, Ly:float, thickness:float, nx:int, ny:int, board_k:float, ir_emmisivity:float,
+                    Tenv:float, interfaces:dict, heaters:dict, C:np.ndarray=None, K_domain:sparse.spmatrix=None, R_domain:sparse.spmatrix=None,
+                    display:bool=False, maxiters:int=1000, objtol:float=0.01, board_c:float=900, board_rho:float=2700,
+                    time:float=0.0, dt:float=0.0, T_init=298.0, n_uniform_samples:int=0):
     '''
     Función solver del problema de PCB rectangular en un entorno radiativo formado por un cuerpo negro a temperatura Tenv. 
     Los nodos van numerados siguiendo el esquema de la figura, los nodos se ordenan de forma creciente filas.
@@ -501,79 +509,44 @@ def PCB_solver_main(solver:str, Lx:float,Ly:float,thickness:float,nx:int,ny:int,
                         -- T (numpy.array con dimension n = nx*ny) = vector con las temperaturas ordenadas como en la figura de ejemplo.
     '''
     
-    n_nodes = nx*ny # número total de nodos
+    n_nodes = nx * ny
+    dx = Lx / (nx - 1)
+    dy = Ly / (ny - 1)
 
-    # cálculo de los GLs y GRs
-    dx = Lx/(nx-1)
-    dy = Ly/(ny-1)
-    GLx = thickness*board_k*dy/dx
-    GLy = thickness*board_k*dx/dy
-    GR = 2*dx*dy*ir_emmisivity
+    # Use provided domain matrices, or create them if needed (for backward compatibility)
+    if C is None or K_domain is None or R_domain is None:
+        domain = PCBDomain(Lx=Lx, Ly=Ly, thickness=thickness, k_xy=board_k,
+                          rho_cp=board_rho * board_c, emissivity=ir_emmisivity)
+        _, _, C, K_domain, R_domain = domain.discretize(nx, ny)
 
-    # Generación de la matriz de acoplamientos conductivos [K]. 
-    # Note: For steady-state, interface rows are set to identity (Dirichlet trick).
-    #       For transient, they are zeroed out and boundary conditions enforced via dTdt=0.
-    K_cols = []
-    K_rows = []
-    K_data = []
-    for j in range(ny):
-        for i in range(nx):
-            id = i + nx*j
-            if id in interfaces:
-                if solver == 'steady':
-                    # Steady-state: diagonal entries for Dirichlet boundary conditions
-                    K_rows.append(id)
-                    K_cols.append(id)
-                    K_data.append(1)
-                # else: transient case — skip (leave row as zero)
-            else:
-                GLii = 0
-                if i+1 < nx:
-                    K_rows.append(id)
-                    K_cols.append(id+1)
-                    K_data.append(-GLx)
-                    GLii += GLx
-                if i-1 >= 0:
-                    K_rows.append(id)
-                    K_cols.append(id-1)
-                    K_data.append(-GLx)
-                    GLii += GLx
-                if j+1 < ny:
-                    K_rows.append(id)
-                    K_cols.append(id+nx)
-                    K_data.append(-GLy)
-                    GLii += GLy
-                if j-1 >= 0:
-                    K_rows.append(id)
-                    K_cols.append(id-nx)
-                    K_data.append(-GLy)
-                    GLii += GLy
-                K_rows.append(id)
-                K_cols.append(id)
-                K_data.append(GLii)
-    K = sparse.csr_matrix((K_data,(K_rows,K_cols)),shape=(n_nodes,n_nodes))
+    # Adjust K and E matrices for interface boundary conditions
+    # For steady-state: interface rows become identity (Dirichlet trick)
+    # For transient: interface rows are zeroed out and dTdt is forced to 0 in RHS
+    K = K_domain.tolil() if solver == 'steady' else K_domain.tolil()
+    E = R_domain.tolil()
 
-    # Creación de la matriz de acoplamientos radiativos [E]
-    E_data = []
-    E_id = []
-    for id in range(n_nodes):
-        if id not in interfaces:
-            E_id.append(id)
-            E_data.append(GR)
-    E = sparse.csr_matrix((E_data,(E_id,E_id)),shape=(n_nodes,n_nodes))
+    if solver == 'steady':
+        # Set interface rows to identity for Dirichlet boundary conditions
+        for nid in interfaces:
+            K[nid, :] = 0.0
+            K[nid, nid] = 1.0
+    else:
+        # For transient: zero out interface rows (dTdt will be forced to 0 in RHS)
+        for nid in interfaces:
+            K[nid, :] = 0.0
 
-    # Creación del vector {Q}.
-    # Note: For transient, interface rows of K are zero and dTdt is forced to 0,
-    # so Q[interface_nodes] should be 0 to avoid confusion. For steady-state,
-    # Q[interface_nodes] holds the Dirichlet values for the Newton solver.
-    Q = np.zeros(n_nodes,dtype=np.double)
-    for id in range(n_nodes):
-        if id in interfaces:
+    K = K.tocsr()
+    E = E.tocsr()
+
+    # Build heat source vector {Q}
+    Q = np.zeros(n_nodes, dtype=np.double)
+    for nid in range(n_nodes):
+        if nid in interfaces:
             if solver == 'steady':
-                Q[id] = interfaces[id]
-            # else transient: leave Q[id] = 0 (K row is zero and dTdt is forced to 0)
-        elif id in heaters:
-            Q[id] = heaters[id]
+                Q[nid] = interfaces[nid]  # Dirichlet values for steady-state
+            # else transient: leave Q[nid] = 0 (K row is zero and dTdt forced to 0)
+        elif nid in heaters:
+            Q[nid] = heaters[nid]
     
     # Resolución de la ecuación no lineal [K]{T} + Boltzmann_cte*[E]({T^4} - Tenv^4) = {Q} 
     # mediante la resolución iterativa de la ecuación [A]{dT_i} = {b}, donde:
@@ -636,7 +609,7 @@ def PCB_solver_main(solver:str, Lx:float,Ly:float,thickness:float,nx:int,ny:int,
         # Adaptive integration with stiffness detection + fallback to Radau
         # First attempt with RK45 (explicit, good for non-stiff to mildly stiff problems)
         sol = solve_ivp(
-            fun=lambda t, T: pcb_rhs(t, T, K, E_aug, Q, F_rad, interface_nodes_id, board_c, board_rho, thickness, dx, dy, Tenv),
+            fun=lambda t, T: pcb_rhs(t, T, K, E_aug, Q, F_rad, interface_nodes_id, C),
             t_span=(0.0, time),
             y0=T_init_vec,
             method='RK45',
@@ -652,7 +625,7 @@ def PCB_solver_main(solver:str, Lx:float,Ly:float,thickness:float,nx:int,ny:int,
             if display:
                 print(f"RK45 returned status {sol.status}: {sol.message}. Retrying with Radau (implicit stiff solver)...")
             sol = solve_ivp(
-                fun=lambda t, T: pcb_rhs(t, T, K, E_aug, Q, F_rad, interface_nodes_id, board_c, board_rho, thickness, dx, dy, Tenv),
+                fun=lambda t, T: pcb_rhs(t, T, K, E_aug, Q, F_rad, interface_nodes_id, C),
                 t_span=(0.0, time),
                 y0=T_init_vec,
                 method='Radau',
@@ -698,10 +671,10 @@ def PCB_solver_main(solver:str, Lx:float,Ly:float,thickness:float,nx:int,ny:int,
 ####################################### Dataset Generation ##########################################
 #####################################################################################################
 
-def generate_dataset(n_samples, time, dt, L=0.1, m=3, board_k=15, board_c=900, board_rho=2700, 
+def generate_dataset(n_samples, time, dt, L=0.1, thickness=0.001, m=3, board_k=15, board_c=900, board_rho=2700, 
                      ir_emmisivity=0.8, Tenv_range=(250, 350), Q_range=(0.1, 5.0), 
                      T_bc_range=(250, 350), T_init_range=(290, 310), T_init_spatial=False,
-                     return_coordinates=True, uniform_time_points=True, n_time_samples=0, verbose=True):
+                     return_coordinates=True, uniform_time_points=True, n_time_samples=0, verbose=True, heater_size=None):
     """
     Generate a diverse dataset for training Neural ODEs or PINNs by varying:
     - Heater powers (Q_heaters)
@@ -719,6 +692,8 @@ def generate_dataset(n_samples, time, dt, L=0.1, m=3, board_k=15, board_c=900, b
         Upper bound on integration step size [s]. If dt=0, solver chooses adaptively.
     L : float
         PCB side length [m].
+    thickness : float
+        PCB thickness [m].
     m : int
         Mesh refinement factor (total nodes = (4*m+1)²).
     board_k, board_c, board_rho : float
@@ -762,6 +737,10 @@ def generate_dataset(n_samples, time, dt, L=0.1, m=3, board_k=15, board_c=900, b
     dataset = []
     n_nodes = (4*m + 1)**2
     
+    # Set heater size: default to L/10 (10% of board side length, independent of mesh)
+    if heater_size is None:
+        heater_size = L / 10
+    
     # Auto-compute n_time_samples if uniform_time_points is True and n_time_samples is 0
     if uniform_time_points and n_time_samples <= 0:
         n_time_samples = max(10, int(np.ceil(time / dt)) if dt > 0 else 100)
@@ -787,7 +766,7 @@ def generate_dataset(n_samples, time, dt, L=0.1, m=3, board_k=15, board_c=900, b
         T_traj, t_arr, interfaces_dict, heaters_dict = PCB_case_2(
             solver='transient',
             L=L,
-            thickness=0.001,
+            thickness=thickness,
             m=m,
             board_k=board_k,
             board_c=board_c,
@@ -800,7 +779,8 @@ def generate_dataset(n_samples, time, dt, L=0.1, m=3, board_k=15, board_c=900, b
             dt=dt,
             T_init=T_init,
             display=False,
-            n_uniform_samples=n_uniform
+            n_uniform_samples=n_uniform,
+            heater_size=heater_size
         )
         
         sample = {
@@ -835,17 +815,19 @@ def generate_dataset(n_samples, time, dt, L=0.1, m=3, board_k=15, board_c=900, b
 ######################################################################################## 
 ################# EJEMPLO DE USO CON LOS VALORES PREDETERMINADOS #######################
 ######################################################################################## 
-# Example 1: Single steady-state solution
-# T1, interfaces1, heaters1 = PCB_case_1(display=True)
 
-# Example 2: Single transient solution
-# T_init_random = np.random.uniform(290, 310, 169)
-# T2, time2, interfaces2, heaters2 = PCB_case_2(solver='transient', display=True, time=10, dt=0.1, T_init=T_init_random)
+if __name__ == '__main__':
+    # Example 1: Single steady-state solution
+    # T1, interfaces1, heaters1 = PCB_case_1(display=True)
 
-# Example 3: Generate training dataset for Neural ODE / PINN
-dataset = generate_dataset(n_samples=10, time=10.0, dt=0.1, m=3, verbose=True)
-# For each sample in dataset:
-#   - sample['T'] has shape (n_steps, n_nodes) — full trajectory
-#   - sample['X'] has shape (n_nodes, 2) — spatial coordinates
-#   - sample['t'], sample['Q'], sample['T_bc'], sample['Tenv'] specify the problem
+    # Example 2: Single transient solution
+    # T_init_random = np.random.uniform(290, 310, 169)
+    # T2, time2, interfaces2, heaters2 = PCB_case_2(solver='transient', display=True, time=10, dt=0.1, T_init=T_init_random)
+
+    # Example 3: Generate training dataset for Neural ODE / PINN
+    dataset = generate_dataset(n_samples=10, time=10.0, dt=0.1, m=3, verbose=True)
+    # For each sample in dataset:
+    #   - sample['T'] has shape (n_steps, n_nodes) — full trajectory
+    #   - sample['X'] has shape (n_nodes, 2) — spatial coordinates
+    #   - sample['t'], sample['Q'], sample['T_bc'], sample['Tenv'] specify the problem
 # %%
