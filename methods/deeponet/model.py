@@ -1,6 +1,8 @@
 from common.base_model import BaseModel
 
-class ModelA(BaseModel):  # rename to ModelB / ModelC in the other files
+class DeepONet(BaseModel):
+    """DeepONet — operator learning for parametric thermal problems."""
+
     def fit(self, X_train, y_train, X_val=None, y_val=None):
         raise NotImplementedError
 
